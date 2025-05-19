@@ -8,12 +8,12 @@ online_store:
     path: data/online_store.db
     vector_enabled: true
     embedding_dim: 384
-    index_type: "IVF_FLAT"
-    metric_type: "COSINE"
+    index_type: IVF_FLAT
+    metric_type: L2
 
 offline_store:
-    type: sqlite
-    path: data/offline_store.db
+    type: file
+    # path: data/offline_store.db
     
 entity_key_serialization_version: 2
 # By default, no_auth for authentication and authorization, other possible values kubernetes and oidc. Refer the documentation for more details.

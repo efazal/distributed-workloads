@@ -11,6 +11,7 @@ class VectorStore(ABC):
     def query(self, query_vector: np.ndarray, query_string: Optional[str], top_k: int) -> List[Dict]:
         pass
 
+
 class FeastVectorStore(VectorStore):
     def __init__(self, store: FeatureStore, rag_view: FeatureView):
         self.store = store
@@ -19,7 +20,7 @@ class FeastVectorStore(VectorStore):
 
     def query(self, query_vector: np.ndarray, query_string: str, top_k: int = 5):
         results = self.store.retrieve_online_documents_v2(
-            features=["wiki_passage_content:text", "wiki_passage_content:embedding"], 
+            features=["wiki_passage_content:text", "wiki_passage_content:embedding"],
             query=query_vector.tolist(), 
             query_string=query_string, 
             top_k=top_k, 
@@ -27,22 +28,35 @@ class FeastVectorStore(VectorStore):
         return results
 
 
-class FeastRAGRetriever:
-    def __init__(self, embedding_model: SentenceTransformer, vector_store: FeastVectorStore):
+class FeastRagRetriever:
+    def __init__(
+        self, 
+        embedding_model: SentenceTransformer, 
+        vector_store: FeastVectorStore
+    ):
         self.embedding_model = embedding_model
         self.vector_store = vector_store
 
     def retrieve(self, query: str, top_k: int = 5) -> List[str]:
         query_vector = self.embedding_model.encode(query)
-        docs = self.vector_store.query(query_vector=query_vector, query_string=query, top_k=top_k)
-        return [doc["text"] for doc in docs]
+        results = self.vector_store.query(query_vector=query_vector, query_string=query, top_k=top_k)
+
+        passage_ids = [res["passage_id"] for res in results]
+
+        matched_passages = self.offline_df[self.offline_df["passage_id"].isin(passage_ids)]
+        passage_map = dict(zip(matched_passages["passage_id"], matched_passages["passage_text"]))
+
+        # Return passage texts in the order of results
+        docs = [passage_map.get(res["passage_id"], "") for res in results]
+        return docs
 
 
 class RAGPipeline:
     def __init__(
         self,
-        retriever: FeastRAGRetriever,
-        generator_model: str = "ibm/granite-3.2-2b-instruct"
+        retriever: FeastRagRetriever,
+        # generator_model: str = "sshleifer/tiny-gpt2"
+        generator_model: str = "ibm-granite/granite-3.2-2b-instruct"
     ):
         self.retriever = retriever
         self.tokenizer = AutoTokenizer.from_pretrained(generator_model)
