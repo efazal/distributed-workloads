@@ -1,11 +1,12 @@
 from abc import ABC, abstractmethod
-from typing import Callable, Dict, List, Optional, Union, Tuple
+from typing import Callable, Dict, List, Optional, Union, Tuple, Any
 
 import numpy
 import numpy as np
 import torch
 from feast import FeatureStore, FeatureView
 from sentence_transformers import SentenceTransformer
+from torch import Tensor
 from transformers import RagRetriever
 
 
@@ -32,32 +33,21 @@ class FeastVectorStore(VectorStore):
 
     def query(
             self,
-            query_vector: Optional[np.ndarray] = None, # Input from FeastRAGRetriever will be np.ndarray
+            query_vector: Optional[np.ndarray] = None,
             query_string: Optional[str] = None,
             top_k: int = 10,
     ):
         distance_metric = "COSINE" if query_vector is not None else None
 
-        milvus_query_arg = None
-        if query_vector is not None:
-            if isinstance(query_vector, torch.Tensor):
-                print("WARNING: FeastVectorStore.query received torch.Tensor for query_vector. Converting to NumPy.")
-                query_vector_np_ready = query_vector.detach().cpu().numpy()
-            elif isinstance(query_vector, np.ndarray):
-                query_vector_np_ready = query_vector
-            else:
-                raise TypeError(f"query_vector in FeastVectorStore.query has unexpected type: {type(query_vector)}. Expected torch.Tensor or np.ndarray.")
-
-            temp_vector = query_vector_np_ready.astype(np.float32)
-
-            if temp_vector.ndim > 1:
-                temp_vector = temp_vector.flatten()
-            temp_vector_list = temp_vector.tolist()
-            milvus_query_arg = temp_vector_list
+        # Ensure query_vector received here is a List[float].
+        if query_vector is not None and not isinstance(query_vector, list):
+            raise TypeError(f"FeastVectorStore.query received unexpected type for query_vector: {type(query_vector)}. Expected List[float].")
+        if query_vector is not None and (len(query_vector) == 0 or not all(isinstance(x, float) for x in query_vector)):
+            raise ValueError(f"FeastVectorStore.query received non-float elements in query_vector: {query_vector[:5]}")
 
         results = self.store.retrieve_online_documents_v2(
             features=self.features,
-            query=milvus_query_arg,
+            query=query_vector,
             query_string=query_string,
             top_k=top_k,
             distance_metric=distance_metric,
@@ -182,8 +172,25 @@ class FeastRAGRetriever(RagRetriever):
             raise TypeError(f"question_hidden_states has unexpected type: {type(question_hidden_states)}. Expected torch.Tensor or np.ndarray.")
 
         print(f"DEBUG: __call__() processed question_hidden_states type: {type(question_hidden_states_tensor)}, device: {question_hidden_states_tensor.device}")
+        print("TENSOR DIMS: ", question_hidden_states_tensor.ndim)
+        # The goal of below logic is to get 3D tensor (batch_size, 1, hidden_size)
+        if question_hidden_states_tensor.ndim == 2: # 2D(batch_size, hidden_size)
+            final_query_vector_for_rag = question_hidden_states_tensor.unsqueeze(1) # Result 3D
+        elif question_hidden_states_tensor.ndim == 1: # 1D(hidden_size,)
+            final_query_vector_for_rag = question_hidden_states_tensor.unsqueeze(0).unsqueeze(1) # Result 3D
+        elif question_hidden_states_tensor.ndim == 3 and question_hidden_states_tensor.shape[1] > 1: # (batch_size, sequence_length, hidden_size)
+            # Perform mean pooling then unsqueeze
+            print("WARNING: question_hidden_states_tensor is 3D with sequence_length > 1. Performing mean pooling.")
+            pooled_output = torch.mean(question_hidden_states_tensor, dim=1) # Result: (batch_size, hidden_size)
+            final_query_vector_for_rag = pooled_output.unsqueeze(1) # Add the '1' dim: (batch_size, 1, hidden_size)
+        elif question_hidden_states_tensor.ndim == 3 and question_hidden_states_tensor.shape[1] == 1:
+            # Already 3D
+            final_query_vector_for_rag = question_hidden_states_tensor
+        else:
+            raise ValueError(f"Unexpected question_hidden_states_tensor shape for RAG bmm: {question_hidden_states_tensor.shape}")
 
-        retrieved_doc_embeds, doc_ids, docs = self.retrieve(question_hidden_states_tensor, n_docs)
+        print("QUERY TYPE: ", final_query_vector_for_rag.dtype)
+        retrieved_doc_embeds, doc_ids, docs = self.retrieve(final_query_vector_for_rag, n_docs)
 
         context_texts = [self.format_document(doc) for doc in docs]
 
@@ -215,7 +222,7 @@ class FeastRAGRetriever(RagRetriever):
             "docs": docs,
             "retrieved_doc_embeds": retrieved_doc_embeds,
             "question_input_ids": question_input_ids.to(target_device) if question_input_ids is not None else None,
-            "question_hidden_states": question_hidden_states_tensor,
+            "question_hidden_states": final_query_vector_for_rag,
         }
 
         print(f"DEBUG: __call__() returning type: {type(return_dict)}")
@@ -227,51 +234,71 @@ class FeastRAGRetriever(RagRetriever):
         return return_dict
 
 
-    def retrieve(self, question_hidden_states: np.ndarray, n_docs: int = 10):
-        # Pooling logic (converting to 1D vector)
-        if question_hidden_states.ndim == 3 and question_hidden_states.shape[0] == 1:
-            pooled_query_vector = question_hidden_states[0].mean(axis=0)
-        elif question_hidden_states.ndim == 2 and question_hidden_states.shape[0] == 1:
-            pooled_query_vector = question_hidden_states[0]
-        elif question_hidden_states.ndim == 1:
-            pooled_query_vector = question_hidden_states
-        else:
-            raise ValueError(f"Unexpected question_hidden_states shape from RAG model: {question_hidden_states.shape}")
+    def retrieve(self, question_hidden_states: torch.Tensor, n_docs: int = 10) -> tuple[Tensor, Tensor, list[Any]]:
+        query_tensor_cpu_np = question_hidden_states.detach().cpu().numpy()
 
-        query_vector_for_feast = pooled_query_vector
+        if query_tensor_cpu_np.ndim == 3 and query_tensor_cpu_np.shape[0] == 1:
+            # For a single query, extract the (hidden_size,) vector
+            query_vector_for_feast_np = query_tensor_cpu_np[0].flatten()
+        elif query_tensor_cpu_np.ndim == 3 and query_tensor_cpu_np.shape[0] > 1:
+            raise ValueError(f"FeastRAGRetriever.retrieve received batch_size > 1. Feast's `query` expects List[float] for a single query. Shape: {query_tensor_cpu_np.shape}")
+        else:
+            raise ValueError(f"Unexpected question_hidden_states shape from __call__ to retrieve: {question_hidden_states.shape}")
 
         print(f"DEBUG: FeastRAGRetriever.retrieve called by RAG model internal forward: ")
-        print(f"  Converted query_vector_for_feast DTYPE: {query_vector_for_feast.dtype}, SHAPE: {query_vector_for_feast.shape}")
+        print(f"  Input question_hidden_states DTYPE: {question_hidden_states.dtype}, SHAPE: {question_hidden_states.shape}")
+        print(f"  Converted query_vector_for_feast DTYPE: {query_vector_for_feast_np.dtype}, SHAPE: {query_vector_for_feast_np.shape}")
 
         feast_results = self.vector_store.query(
-            query_vector=query_vector_for_feast,
+            query_vector=query_vector_for_feast_np.tolist(),
             query_string=None,
             top_k=n_docs
         )
 
         documents_dict = feast_results.to_dict()
-        # print(f"DEBUG: FeastRAGRetriever.retrieve: feast documents_dict: {documents_dict}")
-        retrieved_doc_embeds = torch.tensor(documents_dict["embedding"], dtype=torch.float32)
+
+        print(f"DEBUG: documents_dict keys after Feast query: {documents_dict.keys()}")
+
+        passage_texts = documents_dict.get("passage_text", [])
+        embeddings = documents_dict.get("embedding", [])
+        distances = documents_dict.get("distance", [])
+        passage_ids_str = documents_dict.get("passage_id", [])
+
+        num_retrieved = len(passage_texts)
+        doc_ids = []
+
+        if not passage_ids_str and num_retrieved > 0:
+            print("WARNING: 'passage_id' field is present but empty. Generating sequential dummy IDs.")
+            doc_ids_long = torch.tensor(list(range(num_retrieved)), dtype=torch.long)
+        elif passage_ids_str:
+            try:
+                doc_ids_int_list = [int(id_str) for id_str in passage_ids_str]
+                doc_ids = torch.tensor(doc_ids_int_list, dtype=torch.long)
+                print(f"DEBUG: Converted doc_ids from strings: {doc_ids.tolist()}")
+            except ValueError as e:
+                print(f"ERROR: Could not convert passage_id strings to integers: {e}. Generating sequential dummy IDs.")
+                doc_ids = torch.tensor(list(range(num_retrieved)), dtype=torch.long)
+        else:
+            doc_ids = torch.tensor([], dtype=torch.long)
+
+
+        retrieved_doc_embeds = torch.tensor(embeddings, dtype=torch.float32)
         if retrieved_doc_embeds.ndim == 2:
             retrieved_doc_embeds = retrieved_doc_embeds.unsqueeze(0)
-        passage_ids_str = documents_dict.get("passage_id", [])
-        distances = documents_dict.get("distance", [])
-        doc_ids_int_list = [int(id_str) for id_str in passage_ids_str]
-        doc_ids = torch.tensor(doc_ids_int_list, dtype=torch.long)
+
 
         docs = []
-        num_retrieved = len(documents_dict.get("passage_text", []))
-        for i in range(num_retrieved):
+        num_retrieved_final = min(len(passage_texts), len(embeddings), len(distances), len(doc_ids))
+
+        for i in range(num_retrieved_final):
             doc_content = {
-                "text": documents_dict["passage_text"][i],
-                "id": documents_dict["passage_id"][i],
+                "text": passage_texts[i],
+                "id": doc_ids[i].item(),
                 "score": distances[i] if i < len(distances) and distances[i] is not None else 0.0,
-                "embedding": documents_dict["embedding"][i],
-                "title": documents_dict["passage_text"][i]
+                "embedding": embeddings[i],
+                "title": passage_texts[i]
             }
             docs.append(doc_content)
-
-        # print(f"FeastRAGRetriever.retrieve: RETRIEVED_DOC_EMBEDS: {retrieved_doc_embeds}, DOC_IDS: {doc_ids}, DOCS: {docs}")
 
         return retrieved_doc_embeds, doc_ids, docs
 
@@ -284,11 +311,11 @@ class FeastRAGRetriever(RagRetriever):
         if self.search_type == "text":
             return self.vector_store.query(query_string=query, top_k=top_k)
         elif self.search_type == "vector":
-            return self.vector_store.query(query_vector=query_vector_np, query_string="", top_k=top_k)
+            return self.vector_store.query(query_vector=query_vector_np.tolist(), query_string="", top_k=top_k)
         elif self.search_type == "hybrid":
             return self.vector_store.query(
                 query_string=query,
-                query_vector=query_vector_np,
+                query_vector=query_vector_np.tolist(),
                 top_k=top_k
             )
         else:
